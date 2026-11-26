@@ -1,13 +1,10 @@
-
 import asyncio
 import os
-import re
-import sys
-import uuid
+import sqlite3
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -15,16 +12,35 @@ from aiogram.types import (
     Message,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-# Apna Telegram user ID daalein (jaise {123456789}); khali chhodne par sabko allow karega
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    "9161726440:AAEnKjg4XZuhO-nmIKKUEKiKrA8gBMRIt9A",
+).strip()
+# Apna Telegram user ID daalein (jaise {123456789}); khali rakhne par sabko allow karega
 ALLOWED_USER_IDS: set[int] = set()
 
-BASE_DIR = Path("uploaded_bots")
-BASE_DIR.mkdir(exist_ok=True)
+DB_PATH = Path("file_vault.db")
 
 dp = Dispatcher()
-running_procs: dict[str, asyncio.subprocess.Process] = {}
-bots_registry: dict[str, dict] = {}
+pending_save: dict[int, dict] = {}
+pending_edit_name: dict[int, str] = {}
+
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                UNIQUE(owner_id, name)
+            )
+            """
+        )
+        conn.commit()
 
 
 def is_allowed(user_id: int | None) -> bool:
@@ -33,208 +49,273 @@ def is_allowed(user_id: int | None) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-def safe_filename(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", name)
-    return cleaned or "script.py"
+def extract_file_info(message: Message) -> tuple[str, str] | None:
+    if message.document:
+        return message.document.file_id, "document"
+    if message.photo:
+        return message.photo[-1].file_id, "photo"
+    if message.video:
+        return message.video.file_id, "video"
+    if message.audio:
+        return message.audio.file_id, "audio"
+    if message.voice:
+        return message.voice.file_id, "voice"
+    return None
 
 
-def bot_action_keyboard(bot_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="▶ Run Now", callback_data=f"run:{bot_id}"),
-                InlineKeyboardButton(text="🤖 My Bots", callback_data="my_bots"),
-            ]
-        ]
-    )
+def upsert_file(owner_id: int, name: str, file_id: str, file_type: str) -> None:
+    clean_name = name.strip()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO saved_files (owner_id, name, file_id, file_type)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(owner_id, name) DO UPDATE SET
+                file_id = excluded.file_id,
+                file_type = excluded.file_type
+            """,
+            (owner_id, clean_name, file_id, file_type),
+        )
+        conn.commit()
+
+
+def search_files(owner_id: int, query: str) -> list[tuple[int, str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            SELECT id, name, file_type FROM saved_files
+            WHERE owner_id = ? AND LOWER(name) LIKE LOWER(?)
+            ORDER BY name ASC
+            LIMIT 15
+            """,
+            (owner_id, f"%{query.strip()}%"),
+        )
+        return cur.fetchall()
+
+
+def get_file_by_id(owner_id: int, row_id: int) -> tuple[int, str, str, str] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            SELECT id, name, file_id, file_type FROM saved_files
+            WHERE owner_id = ? AND id = ?
+            """,
+            (owner_id, row_id),
+        )
+        return cur.fetchone()
+
+
+def rename_file(owner_id: int, old_name: str, new_name: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            UPDATE saved_files SET name = ?
+            WHERE owner_id = ? AND LOWER(name) = LOWER(?)
+            """,
+            (new_name.strip(), owner_id, old_name.strip()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+async def send_stored_file(
+    message: Message, file_id: str, file_type: str, caption: str
+) -> None:
+    if file_type == "photo":
+        await message.answer_photo(photo=file_id, caption=caption, parse_mode="HTML")
+    elif file_type == "video":
+        await message.answer_video(video=file_id, caption=caption, parse_mode="HTML")
+    elif file_type == "audio":
+        await message.answer_audio(audio=file_id, caption=caption, parse_mode="HTML")
+    elif file_type == "voice":
+        await message.answer_voice(voice=file_id, caption=caption, parse_mode="HTML")
+    else:
+        await message.answer_document(document=file_id, caption=caption, parse_mode="HTML")
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
     if not is_allowed(message.from_user.id if message.from_user else None):
-        await message.answer("Aapko is bot ko use karne ki permission nahi hai.")
+        await message.answer("Permission nahi hai.")
         return
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🤖 My Bots", callback_data="my_bots")]
-        ]
-    )
-    await message.answer(
-        "Mujhe koi bhi <b>.py</b> file bhejein. Upload ke baad aap <b>Run Now</b> se usse chala sakenge.",
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-
-
-@dp.message(F.document)
-async def document_handler(message: Message, bot: Bot) -> None:
-    user_id = message.from_user.id if message.from_user else None
-    if not is_allowed(user_id):
-        await message.answer("Aapko is bot ko use karne ki permission nahi hai.")
-        return
-
-    doc = message.document
-    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".py"):
-        await message.answer("Kripya sirf ek <b>.py</b> file bhejein.", parse_mode="HTML")
-        return
-
-    bot_id = uuid.uuid4().hex[:24]
-    filename = safe_filename(doc.file_name)
-    bot_folder = BASE_DIR / bot_id
-    bot_folder.mkdir(parents=True, exist_ok=True)
-    file_path = bot_folder / filename
-
-    tg_file = await bot.get_file(doc.file_id)
-    await bot.download_file(tg_file.file_path, destination=file_path)
-
-    size_kb = round((doc.file_size or file_path.stat().st_size) / 1024, 1)
-    bots_registry[bot_id] = {
-        "owner_id": user_id,
-        "filename": filename,
-        "path": str(file_path),
-        "size_kb": size_kb,
-        "status": "Uploaded",
-    }
 
     text = (
-        "✅ <b>FILE UPLOADED!</b>\n\n"
-        f"📄 <code>{filename}</code>\n"
-        f"🆔 Bot ID: <code>#{bot_id}</code>\n"
-        "🐍 Python\n"
-        f"📦 Size: {size_kb} KB"
+        "📁 <b>Personal File Vault Bot</b>\n\n"
+        "• <b>Save:</b> <code>/save apna_naam</code> likhein aur file bhejein (ya file ke caption mein naam likhein).\n"
+        "• <b>Search & Download:</b> <code>/find naam</code> likhein.\n"
+        "• <b>Rename:</b> <code>/rename purana_naam | naya_naam</code>\n"
+        "• <b>Edit / Replace file:</b> <code>/edit naam</code> likhein aur nayi file bhej dein."
     )
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=bot_action_keyboard(bot_id),
-    )
+    await message.answer(text, parse_mode="HTML")
 
 
-async def run_with_retries(status_msg: Message, bot_id: str, max_attempts: int = 3) -> None:
-    info = bots_registry.get(bot_id)
-    if not info:
-        await status_msg.edit_text("❌ Bot record nahi mila.")
+@dp.message(Command("save"))
+async def save_cmd_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
         return
 
-    filename = info["filename"]
-    file_path = info["path"]
-    size_kb = info["size_kb"]
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Use: <code>/save file_ka_naam</code>", parse_mode="HTML")
+        return
 
-    old_proc = running_procs.get(bot_id)
-    if old_proc and old_proc.returncode is None:
-        old_proc.terminate()
-        try:
-            await asyncio.wait_for(old_proc.wait(), timeout=3)
-        except asyncio.TimeoutError:
-            old_proc.kill()
+    file_name = parts[1].strip()
+    pending_save[user_id] = {"name": file_name}
+    await message.answer(
+        f"Ab woh file bhejein jise <b>{file_name}</b> naam se save karna hai.",
+        parse_mode="HTML",
+    )
 
-    for attempt in range(1, max_attempts + 1):
-        info["status"] = f"Starting (Attempt {attempt}/{max_attempts})"
-        await status_msg.edit_text(
-            "🚀 <b>Starting Bot...</b>\n\n"
-            f"📄 <code>{filename}</code>\n"
-            "🐍 Python\n"
-            f"🔄 Attempt: {attempt}/{max_attempts}",
+
+@dp.message(Command("edit"))
+async def edit_cmd_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Use: <code>/edit saved_file_ka_naam</code>", parse_mode="HTML")
+        return
+
+    target_name = parts[1].strip()
+    pending_edit_name[user_id] = target_name
+    await message.answer(
+        f"<b>{target_name}</b> ko replace karne ke liye nayi file bhejein.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("rename"))
+async def rename_cmd_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+
+    raw = (message.text or "").split(maxsplit=1)
+    if len(raw) < 2 or "|" not in raw[1]:
+        await message.answer(
+            "Use: <code>/rename purana_naam | naya_naam</code>",
             parse_mode="HTML",
         )
+        return
 
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-u",
-            file_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    old_name, new_name = [x.strip() for x in raw[1].split("|", 1)]
+    if not old_name or not new_name:
+        await message.answer("Dono naam sahi se likhein.", parse_mode="HTML")
+        return
+
+    ok = rename_file(user_id, old_name, new_name)
+    if ok:
+        await message.answer(
+            f"✅ Renamed: <code>{old_name}</code> ➡️ <code>{new_name}</code>",
+            parse_mode="HTML",
         )
-        running_procs[bot_id] = proc
-
-        await asyncio.sleep(2.0)
-
-        if proc.returncode is None:
-            info["status"] = "Running"
-            await status_msg.edit_text(
-                "🟢 <b>Bot Live / Running!</b>\n\n"
-                f"📄 <code>{filename}</code>\n"
-                f"🆔 Bot ID: <code>#{bot_id}</code>\n"
-                f"📦 Size: {size_kb} KB\n"
-                f"🔄 Attempt: {attempt}/{max_attempts}",
-                parse_mode="HTML",
-                reply_markup=bot_action_keyboard(bot_id),
-            )
-            return
-
-        _, stderr_data = await proc.communicate()
-        err_text = stderr_data.decode(errors="replace").strip()
-        last_line = err_text.splitlines()[-1] if err_text else "Process exited early"
-
-        if attempt < max_attempts:
-            await status_msg.edit_text(
-                "⚠️ <b>Bot turant band ho gaya, dobara try kar raha hai...</b>\n\n"
-                f"📄 <code>{filename}</code>\n"
-                f"🔄 Attempt: {attempt}/{max_attempts}\n"
-                f"❌ Error: <code>{last_line[:180]}</code>",
-                parse_mode="HTML",
-            )
-            await asyncio.sleep(1.5)
-        else:
-            info["status"] = "Failed"
-            await status_msg.edit_text(
-                "❌ <b>Bot start nahi ho saka.</b>\n\n"
-                f"📄 <code>{filename}</code>\n"
-                f"🔄 Attempt: {attempt}/{max_attempts}\n"
-                f"❌ Error: <code>{last_line[:250]}</code>",
-                parse_mode="HTML",
-                reply_markup=bot_action_keyboard(bot_id),
-            )
+    else:
+        await message.answer("❌ Is naam se koi saved file nahi mili.")
 
 
-@dp.callback_query(F.data.startswith("run:"))
-async def run_callback_handler(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
-        await callback.answer("Permission nahi hai.", show_alert=True)
+@dp.message(Command("find", "search"))
+async def find_cmd_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
         return
 
-    bot_id = callback.data.split(":", 1)[1]
-    if bot_id not in bots_registry:
-        await callback.answer("Bot nahi mila.", show_alert=True)
+    parts = (message.text or "").split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    matches = search_files(user_id, query)
+
+    if not matches:
+        await message.answer("🔍 Koi matching file nahi mili.")
         return
 
-    await callback.answer("Bot start ho raha hai...")
-    asyncio.create_task(run_with_retries(callback.message, bot_id))
-
-
-@dp.callback_query(F.data == "my_bots")
-async def my_bots_handler(callback: CallbackQuery) -> None:
-    if not is_allowed(callback.from_user.id):
-        await callback.answer("Permission nahi hai.", show_alert=True)
-        return
-
-    user_bots = [
-        (bid, data)
-        for bid, data in bots_registry.items()
-        if data["owner_id"] == callback.from_user.id
+    buttons = [
+        [InlineKeyboardButton(text=f"📄 {name} (Download)", callback_data=f"dl:{row_id}")]
+        for row_id, name, _ in matches
     ]
-    if not user_bots:
-        await callback.answer("Abhi koi bot upload nahi hua hai.", show_alert=True)
+    await message.answer(
+        "🔎 <b>Matching Files:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def download_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not is_allowed(user_id):
+        await callback.answer("Permission nahi hai.", show_alert=True)
         return
 
-    lines = ["🤖 <b>Aapke Bots:</b>\n"]
-    for bid, data in user_bots[-10:]:
-        lines.append(
-            f"• <code>{data['filename']}</code> (<code>#{bid[:8]}</code>) — <b>{data['status']}</b>"
-        )
+    row_id = int(callback.data.split(":", 1)[1])
+    row = get_file_by_id(user_id, row_id)
+    if not row:
+        await callback.answer("File nahi mili.", show_alert=True)
+        return
 
-    await callback.answer()
-    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+    _, name, file_id, file_type = row
+    await callback.answer("Sending file...")
+    await send_stored_file(
+        callback.message,
+        file_id=file_id,
+        file_type=file_type,
+        caption=f"📦 <b>{name}</b>",
+    )
+
+
+@dp.message(F.document | F.photo | F.video | F.audio | F.voice)
+async def file_receive_handler(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_allowed(user_id):
+        return
+
+    info = extract_file_info(message)
+    if not info:
+        return
+
+    file_id, file_type = info
+
+    if user_id in pending_edit_name:
+        target_name = pending_edit_name.pop(user_id)
+        upsert_file(user_id, target_name, file_id, file_type)
+        await message.answer(
+            f"✏️ File updated: <b>{target_name}</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    if user_id in pending_save:
+        custom_name = pending_save.pop(user_id)["name"]
+        upsert_file(user_id, custom_name, file_id, file_type)
+        await message.answer(
+            f"✅ Saved as <b>{custom_name}</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    if message.caption and message.caption.strip():
+        cap_name = message.caption.strip()
+        upsert_file(user_id, cap_name, file_id, file_type)
+        await message.answer(
+            f"✅ Saved as <b>{cap_name}</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.answer(
+        "File mil gayi! Isko kisi naam se save karne ke liye likhein: <code>/save apna_naam</code>",
+        parse_mode="HTML",
+    )
 
 
 async def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable set nahi hai.")
+        raise RuntimeError("BOT_TOKEN set nahi hai.")
+    init_db()
     bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-  
