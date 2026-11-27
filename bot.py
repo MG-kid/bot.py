@@ -319,7 +319,7 @@ async def approve_user_callback(callback: CallbackQuery) -> None:
     try:
         await callback.bot.send_message(
             target_user_id,
-            "🎉 Aapka account approve ho gaya hai! Ab aap bot use kar sakte hain.",
+            "🎉 Your account approved.",
             reply_markup=main_menu_keyboard(target_user_id),
         )
     except Exception:
@@ -502,7 +502,7 @@ async def admin_delete_file_callback(callback: CallbackQuery) -> None:
             ]
         )
         await callback.message.edit_text(
-            f"✅ File remove ho gayi. <b>{uname_display}</b> ke paas ab koi file nahi bachi.",
+            f"✅ File removed. <b>{uname_display}</b> ke paas ab koi file nahi bachi.",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -518,7 +518,7 @@ async def admin_delete_file_callback(callback: CallbackQuery) -> None:
     buttons.append([InlineKeyboardButton(text="⬅️ Back to Users", callback_data="adm:users")])
 
     await callback.message.edit_text(
-        f"✅ File remove ho gayi. <b>{uname_display}</b> ki Saved Files:",
+        f"✅ File removed. <b>{uname_display}</b> ki Saved Files:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
@@ -550,7 +550,7 @@ async def action_buttons_callback(callback: CallbackQuery) -> None:
     if action == "save":
         user_state[user_id] = {"step": "waiting_save_name"}
         await callback.message.answer(
-            "➕ File kis <b>naam</b> se save karni hai? Naam likh kar bhejein:",
+            "➕  <b>naam</b> send the file  name:",
             parse_mode="HTML",
         )
         await callback.answer()
@@ -559,7 +559,7 @@ async def action_buttons_callback(callback: CallbackQuery) -> None:
     if action == "find":
         user_state[user_id] = {"step": "waiting_find"}
         await callback.message.answer(
-            "🔎 File ka <b>naam</b> (ya part of name) likh kar bhejein:",
+            "🔎 enter file name <b>naam</b> (ya part of name) :",
             parse_mode="HTML",
         )
         await callback.answer()
@@ -599,7 +599,7 @@ async def action_buttons_callback(callback: CallbackQuery) -> None:
         ]
         buttons.append([InlineKeyboardButton(text="🏠 Menu", callback_data="act:menu")])
         await callback.message.answer(
-            "📂 <b>Aapki Saved Files</b> (download ke liye tap karein):",
+            "📂 <b> Saved Files</b> ( tap to download):",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
@@ -640,7 +640,7 @@ async def file_receive_handler(message: Message) -> None:
     user_id = message.from_user.id
 
     if not is_approved_user(user_id):
-        await message.answer("⏳ Aapka account abhi approved nahi hai.")
+        await message.answer("⏳ wait for account approval!.")
         return
 
     info = extract_file_info(message)
